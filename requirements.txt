@@ -4,3 +4,4 @@ Pillow
 imageio-ffmpeg
 ai-edge-litert
 win11toast
+sounddevice  # 实时播放摄像头声音（含 PortAudio）
