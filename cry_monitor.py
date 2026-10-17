@@ -38,6 +38,8 @@ logging.basicConfig(
 
 DEFAULT_CONFIG = {
     "rtsp_video_url": "rtsp://192.168.1.100:554/stream1",
+    # RTSP 传输协议：udp（局域网推荐，延迟低、丢包不卡死）或 tcp
+    "rtsp_transport": "udp",
     # 音频地址：留空 = 与视频共用一路 RTSP（单会话，不额外占带宽）；
     # 摄像头有纯音频子码流时可单独填（如小蚁刷机版的 ch0_1），此时走双会话但音频路只传音频
     "rtsp_audio_url": "",
@@ -378,7 +380,7 @@ class MonitorApp:
                     srv.listen(1)
                     srv.settimeout(15)
                     a_port = srv.getsockname()[1]
-                    cmd = [self.ffmpeg, "-rtsp_transport", "tcp", "-timeout", "10000000",
+                    cmd = [self.ffmpeg, "-rtsp_transport", self.cfg.get("rtsp_transport", "udp"), "-timeout", "10000000",
                            "-i", video_url,
                            "-map", "0:v", "-f", "rawvideo", "-pix_fmt", "bgr24",
                            "-s", f"{w}x{h}", "-r", str(fps), "-an", "-",
@@ -386,7 +388,7 @@ class MonitorApp:
                            "-ar", str(SAMPLE_RATE), "-acodec", "pcm_s16le",
                            f"tcp://127.0.0.1:{a_port}"]
                 else:
-                    cmd = [self.ffmpeg, "-rtsp_transport", "tcp", "-timeout", "10000000",
+                    cmd = [self.ffmpeg, "-rtsp_transport", self.cfg.get("rtsp_transport", "udp"), "-timeout", "10000000",
                            "-i", video_url,
                            "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{w}x{h}",
                            "-r", str(fps), "-an", "-"]
@@ -518,7 +520,7 @@ class MonitorApp:
             return
         while self.running and not self.stop_event.is_set():
             try:
-                cmd = [self.ffmpeg, "-rtsp_transport", "tcp", "-timeout", "10000000",
+                cmd = [self.ffmpeg, "-rtsp_transport", self.cfg.get("rtsp_transport", "udp"), "-timeout", "10000000",
                        "-i", audio_url,
                        "-vn", "-f", "s16le", "-ac", "1", "-ar", str(SAMPLE_RATE),
                        "-acodec", "pcm_s16le", "-"]
@@ -549,7 +551,7 @@ class MonitorApp:
                 return
             self.set_status("正在检测音频流…")
             try:
-                cmd = [self.ffmpeg, "-rtsp_transport", "tcp", "-timeout", "10000000",
+                cmd = [self.ffmpeg, "-rtsp_transport", self.cfg.get("rtsp_transport", "udp"), "-timeout", "10000000",
                        "-i", audio_url,
                        "-vn", "-f", "s16le", "-ac", "1", "-ar", "16000",
                        "-acodec", "pcm_s16le", "-t", "4", "-"]
