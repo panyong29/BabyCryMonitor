@@ -118,6 +118,8 @@ class MonitorApp:
         self.procs_lock = threading.Lock()
         self.stop_event = threading.Event()
         self.last_alert = 0.0
+        self.last_audio_time = 0.0   # 主路最近一次收到音频块的时间
+        self.last_audio_peak = 0.0   # 主路最近一块音频的峰值
         self.video_label_img = None
         self._last_frame = None  # 上一帧 PIL 图，供窗口缩放时立即重绘
         self._resize_after_id = None  # 缩放防抖计时器
@@ -448,6 +450,8 @@ class MonitorApp:
 
         def handle_pcm(raw):
             pcm = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+            self.last_audio_time = time.time()
+            self.last_audio_peak = float(np.max(np.abs(pcm)))
             if player is not None:
                 try:
                     gain = 0.0 if self.mute_var.get() else self.volume_var.get() / 100.0
@@ -543,6 +547,13 @@ class MonitorApp:
 
     # ---------- 自检 ----------
     def selftest_audio(self):
+        # 监控运行时主路已有音频数据：直接用实时数据判断，不再开第二路 RTSP
+        # （yi-hack 的 RTSP 服务弱，第二路会被饿死导致误报无音频）
+        if self.running and (time.time() - self.last_audio_time) < 5:
+            peak = self.last_audio_peak
+            self.set_status("音频流正常（主路实时，峰值 %.3f）" % peak)
+            messagebox.showinfo("自检", "音频流正常！\n\n主路实时音频峰值 %.3f。\n在摄像头旁拍手，峰值会明显跳动。" % peak)
+            return
         def _run():
             audio_url = (self.cfg.get("rtsp_audio_url") or "").strip() \
                 or (self.cfg.get("rtsp_video_url") or "").strip()
@@ -555,10 +566,14 @@ class MonitorApp:
                        "-i", audio_url,
                        "-vn", "-f", "s16le", "-ac", "1", "-ar", "16000",
                        "-acodec", "pcm_s16le", "-t", "4", "-"]
-                p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                      creationflags=_NO_WINDOW)
-                data = p.stdout.read()
-                p.wait(timeout=10)
+                try:
+                    data, err = p.communicate(timeout=15)
+                except subprocess.TimeoutExpired:
+                    p.kill()
+                    data, err = p.communicate()
+                err_txt = (err or b"").decode("utf-8", "ignore")[-800:]
                 if len(data) > 16000:
                     import numpy as np
                     pcm = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
@@ -567,7 +582,7 @@ class MonitorApp:
                     messagebox.showinfo("自检", "音频流正常！\n\n4 秒收到 %d 字节，峰值 %.3f。\n在摄像头旁拍手，峰值会明显跳动。" % (len(data), peak))
                 else:
                     self.set_status("音频流无数据", error=True)
-                    messagebox.showwarning("自检", "连上了但没收到音频数据。\n\n检查摄像头后台的音频（伴音）开关是否打开。")
+                    messagebox.showwarning("自检", "连上了但没收到音频数据（%d 字节）。\n\nffmpeg 输出：\n%s" % (len(data), err_txt or "（无）"))
             except Exception as e:  # noqa: BLE001
                 self.set_status("音频流连接失败", error=True)
                 messagebox.showerror("自检", "音频流连接失败：\n%s\n\n检查 config.json 里的地址和摄像头 IP。" % e)
