@@ -139,11 +139,15 @@ class MonitorApp:
         ttk.Checkbutton(top, text="开机自启", variable=self.autostart_var,
                         command=self._toggle_autostart).pack(side="right", padx=4)
 
-        self.video_label = ttk.Label(self.root, text="视频未启动", anchor="center",
-                                     background="black", foreground="gray",
-                                     width=80)
-        self.video_label.pack(fill="both", expand=True, padx=8, pady=4)
-        self.video_label.bind("<Configure>", self._on_video_resize)
+        # 视频区：外层 Frame 负责布局（pack_propagate 关掉，内部图片尺寸
+        # 不影响外部布局，打破"图片变大→label 变大→重绘更大图片"的几何反馈回路）
+        self.video_frame = tk.Frame(self.root, background="black")
+        self.video_frame.pack(fill="both", expand=True, padx=8, pady=4)
+        self.video_frame.pack_propagate(False)
+        self.video_label = ttk.Label(self.video_frame, text="视频未启动", anchor="center",
+                                     background="black", foreground="gray")
+        self.video_label.place(relx=0.5, rely=0.5, anchor="center")
+        self.video_frame.bind("<Configure>", self._on_video_resize)
 
         info = ttk.Frame(self.root, padding=(8, 0))
         info.pack(fill="x")
