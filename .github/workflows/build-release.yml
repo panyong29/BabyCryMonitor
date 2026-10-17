@@ -1,0 +1,64 @@
+name: Build Windows EXE & Release
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+    paths-ignore: ["README.md"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: Download YAMNet model
+        shell: pwsh
+        run: |
+          $url = "https://tfhub.dev/google/lite-model/yamnet/classification/tflite/1?lite-format=tflite"
+          $out = "assets/yamnet.tflite"
+          $ok = $false
+          for ($i = 1; $i -le 5; $i++) {
+            try {
+              Invoke-WebRequest -Uri $url -OutFile $out -UseBasicParsing -TimeoutSec 120
+              if ((Get-Item $out).Length -gt 1000000) { $ok = $true; break }
+            } catch { Start-Sleep -Seconds 10 }
+          }
+          if (-not $ok) { throw "model download failed" }
+          Get-Item $out | Select-Object Name, Length
+
+      - name: Stage ffmpeg binary
+        shell: pwsh
+        run: |
+          python -c "import imageio_ffmpeg, shutil; shutil.copy(imageio_ffmpeg.get_ffmpeg_exe(), 'ffmpeg.exe')"
+          dir ffmpeg.exe
+
+      - name: Build EXE
+        shell: pwsh
+        run: >
+          pyinstaller --onefile --windowed --name BabyCryMonitor
+          --add-binary "ffmpeg.exe;."
+          --add-data "assets/yamnet.tflite;assets"
+          --add-data "assets/yamnet_class_map.csv;assets"
+          cry_monitor.py
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/BabyCryMonitor.exe
+          tag_name: build-${{ github.run_number }}
+          name: BabyCryMonitor build ${{ github.run_number }}
+          generate_release_notes: false
