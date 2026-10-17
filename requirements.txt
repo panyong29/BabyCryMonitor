@@ -1,0 +1,6 @@
+# Windows 运行依赖（GitHub Actions windows-latest 构建用）
+numpy
+Pillow
+imageio-ffmpeg
+ai-edge-litert
+win11toast
