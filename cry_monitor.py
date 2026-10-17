@@ -16,7 +16,7 @@ import time
 import tkinter as tk
 from tkinter import messagebox, ttk
 
-APP_VERSION = "1.0.2"
+APP_VERSION = "1.0.3"
 
 # Windows 下拉起 ffmpeg（控制台程序）时不弹黑框；非 Windows 为 0 无影响
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -43,6 +43,8 @@ DEFAULT_CONFIG = {
     "loud_seconds": 2.0,
     "yamnet_threshold": 0.5,
     "cooldown_seconds": 60,
+    "volume": 80,
+    "muted": False,
     "video_width": 640,
     "video_height": 360,
     "video_fps": 8,
@@ -103,12 +105,19 @@ class MonitorApp:
         self.frame_q = queue.Queue(maxsize=2)
         self.status_q = queue.Queue()
         self.threads = []
+        # ffmpeg 子进程登记：退出时统一杀掉，防止孤儿进程占住 RTSP 连接
+        self.procs = []
+        self.procs_lock = threading.Lock()
         self.stop_event = threading.Event()
         self.last_alert = 0.0
         self.video_label_img = None
+        self._last_frame = None  # 上一帧 PIL 图，供窗口缩放时立即重绘
         # 视频显示尺寸（跟随窗口变化，初始为配置分辨率）
         self._disp_w = self.cfg.get("video_width", 640)
         self._disp_h = self.cfg.get("video_height", 360)
+        # 音量（0~100）与静音
+        self.volume_var = tk.IntVar(value=int(self.cfg.get("volume", 80)))
+        self.mute_var = tk.BooleanVar(value=bool(self.cfg.get("muted", False)))
 
         self._build_ui()
         self._poll()
@@ -143,6 +152,11 @@ class MonitorApp:
         self.audio_label.pack(side="left", padx=12)
         self.last_label = ttk.Label(info, text="上次提醒：--")
         self.last_label.pack(side="left", padx=12)
+        ttk.Label(info, text="音量").pack(side="left", padx=(12, 2))
+        self.volume_scale = ttk.Scale(info, from_=0, to=100, orient="horizontal",
+                                      variable=self.volume_var, length=110)
+        self.volume_scale.pack(side="left")
+        ttk.Checkbutton(info, text="静音", variable=self.mute_var).pack(side="left", padx=4)
 
         self.status_var = tk.StringVar(value="就绪")
         ttk.Label(self.root, textvariable=self.status_var, anchor="w",
@@ -151,6 +165,72 @@ class MonitorApp:
     def _on_video_resize(self, event):
         if event.width > 10 and event.height > 10:
             self._disp_w, self._disp_h = event.width, event.height
+            self._redraw_video()  # 窗口一变就用上一帧立即重绘，不等轮询
+
+    def _redraw_video(self):
+        """主线程：把上一帧按显示尺寸等比缩放后显示。"""
+        img = self._last_frame
+        if img is None:
+            return
+        from PIL import Image, ImageTk
+        lw, lh = self._disp_w, self._disp_h
+        if lw > 10 and lh > 10:
+            scale = min(lw / img.width, lh / img.height)
+            nw, nh = max(1, int(img.width * scale)), max(1, int(img.height * scale))
+            if (nw, nh) != img.size:
+                img = img.resize((nw, nh), Image.BILINEAR)
+        photo = ImageTk.PhotoImage(img)
+        self.video_label_img = photo
+        self.video_label.config(image=photo, text="")
+
+    # ---------- 子进程管理（防孤儿进程占住 RTSP） ----------
+    def _register_proc(self, p):
+        with self.procs_lock:
+            self.procs.append(p)
+        return p
+
+    def _close_proc(self, p):
+        try:
+            if p.poll() is None:
+                p.terminate()
+                try:
+                    p.wait(timeout=5)
+                except Exception:  # noqa: BLE001
+                    p.kill()
+        except Exception:  # noqa: BLE001
+            pass
+        finally:
+            with self.procs_lock:
+                if p in self.procs:
+                    self.procs.remove(p)
+
+    def _kill_all_procs(self):
+        with self.procs_lock:
+            procs = list(self.procs)
+            self.procs.clear()
+        for p in procs:
+            try:
+                if p.poll() is None:
+                    p.terminate()
+            except Exception:  # noqa: BLE001
+                pass
+        for p in procs:
+            try:
+                p.wait(timeout=3)
+            except Exception:  # noqa: BLE001
+                try:
+                    p.kill()
+                except Exception:  # noqa: BLE001
+                    pass
+
+    def _save_config(self):
+        try:
+            self.cfg["volume"] = int(self.volume_var.get())
+            self.cfg["muted"] = bool(self.mute_var.get())
+            with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+                json.dump(self.cfg, f, ensure_ascii=False, indent=2)
+        except Exception:  # noqa: BLE001
+            pass
 
     def set_status(self, text, error=False):
         self.status_q.put((text, error))
@@ -170,17 +250,8 @@ class MonitorApp:
         except queue.Empty:
             pass
         try:
-            from PIL import Image, ImageTk
-            img = self.frame_q.get_nowait()
-            # 按显示区域等比缩放（主线程做，tkinter 非线程安全）
-            lw, lh = self._disp_w, self._disp_h
-            if lw > 10 and lh > 10 and (img.width, img.height) != (lw, lh):
-                scale = min(lw / img.width, lh / img.height)
-                nw, nh = max(1, int(img.width * scale)), max(1, int(img.height * scale))
-                img = img.resize((nw, nh), Image.BILINEAR)
-            photo = ImageTk.PhotoImage(img)
-            self.video_label_img = photo
-            self.video_label.config(image=photo, text="")
+            self._last_frame = self.frame_q.get_nowait()
+            self._redraw_video()
         except queue.Empty:
             pass
         self.root.after(100, self._poll)
@@ -204,15 +275,21 @@ class MonitorApp:
     def stop(self):
         self.running = False
         self.stop_event.set()
+        self._kill_all_procs()
+        for t in self.threads:
+            t.join(timeout=3)
+        self.threads = []
         self.btn_start.config(state="normal")
         self.btn_stop.config(state="disabled")
         self.video_label.config(image="", text="视频未启动")
         self.video_label_img = None
+        self._last_frame = None
+        self.audio_label.config(text="音频流：--")
         self.set_status("已停止")
 
     def on_close(self):
+        self._save_config()
         self.stop()
-        time.sleep(0.3)
         self.root.destroy()
 
     # ---------- 视频 ----------
@@ -229,8 +306,9 @@ class MonitorApp:
                 cmd = [self.ffmpeg, "-rtsp_transport", "tcp", "-i", video_url,
                        "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{w}x{h}",
                        "-r", str(fps), "-an", "-"]
-                p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                                     creationflags=_NO_WINDOW)
+                p = self._register_proc(subprocess.Popen(
+                    cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                    creationflags=_NO_WINDOW))
                 self.set_status("视频流已连接")
                 while self.running and not self.stop_event.is_set():
                     raw = p.stdout.read(frame_bytes)
@@ -246,14 +324,14 @@ class MonitorApp:
                         except queue.Empty:
                             pass
                         self.frame_q.put_nowait(img)
-                p.terminate()
+                self._close_proc(p)
             except Exception as e:  # noqa: BLE001
                 logging.warning("视频流异常: %s", e)
-            if self.running:
+            if self.running and not self.stop_event.is_set():
                 self.set_status("视频流断开，5 秒后重连…（检查 config.json 里 rtsp_video_url 对不对）", error=True)
-                time.sleep(5)
+                self.stop_event.wait(5)
 
-    # ---------- 音频检测 ----------
+    # ---------- 音频检测 + 实时播放 ----------
     def _audio_loop(self):
         import numpy as np
         from detection import CryDetector, SAMPLE_RATE, CHUNK_SECONDS
@@ -266,14 +344,25 @@ class MonitorApp:
             return
         detector = CryDetector(self.cfg)
         self.mode_label.config(text="检测模式：" + detector.mode)
+        # 实时播放：有声卡就播，无声卡只做检测不报错
+        player = None
+        try:
+            import sounddevice as sd
+            player = sd.OutputStream(samplerate=SAMPLE_RATE, channels=1,
+                                     dtype="float32", blocksize=int(SAMPLE_RATE * CHUNK_SECONDS))
+            player.start()
+        except Exception as e:  # noqa: BLE001
+            logging.warning("音频播放不可用（只做检测）: %s", e)
+            player = None
         chunk_bytes = int(SAMPLE_RATE * CHUNK_SECONDS) * 2
         while self.running and not self.stop_event.is_set():
             try:
                 cmd = [self.ffmpeg, "-rtsp_transport", "tcp", "-i", audio_url,
                        "-vn", "-f", "s16le", "-ac", "1", "-ar", str(SAMPLE_RATE),
                        "-acodec", "pcm_s16le", "-"]
-                p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                                     creationflags=_NO_WINDOW)
+                p = self._register_proc(subprocess.Popen(
+                    cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                    creationflags=_NO_WINDOW))
                 self.audio_label.config(text="音频流：已连接")
                 self.set_status("监听中…")
                 while self.running and not self.stop_event.is_set():
@@ -281,6 +370,12 @@ class MonitorApp:
                     if len(raw) < chunk_bytes:
                         break
                     pcm = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+                    if player is not None:
+                        try:
+                            gain = 0.0 if self.mute_var.get() else self.volume_var.get() / 100.0
+                            player.write((pcm * gain).astype(np.float32))
+                        except Exception:  # noqa: BLE001
+                            pass
                     triggered, info = detector.feed(pcm)
                     if triggered:
                         now = time.time()
@@ -288,12 +383,18 @@ class MonitorApp:
                             self.last_alert = now
                             logging.info("哭声触发: %s", info)
                             self.alert_q.put(("🍼 宝宝哭声", "检测到哭声（%s），快去看一下" % info))
-                p.terminate()
+                self._close_proc(p)
             except Exception as e:  # noqa: BLE001
                 logging.warning("音频流异常: %s", e)
-            if self.running:
+            if self.running and not self.stop_event.is_set():
                 self.audio_label.config(text="音频流：重连中…")
-                time.sleep(5)
+                self.stop_event.wait(5)
+        if player is not None:
+            try:
+                player.stop()
+                player.close()
+            except Exception:  # noqa: BLE001
+                pass
 
     # ---------- 自检 ----------
     def selftest_audio(self):
