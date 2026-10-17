@@ -1,1 +1,12 @@
-{"cooldown_seconds":60,"energy_threshold":0.02,"loud_seconds":2.0,"rtsp_audio_url":"rtsp://192.168.1.100:554/stream1","rtsp_video_url":"rtsp://192.168.1.100:554/stream1","video_fps":8,"video_height":360,"video_width":640,"yamnet_threshold":0.5}
+{
+  "cooldown_seconds": 60,
+  "energy_threshold": 0.02,
+  "loud_seconds": 2.0,
+  "rtsp_audio_url": "rtsp://192.168.1.100:554/stream1",
+  "rtsp_video_url": "rtsp://192.168.1.100:554/stream1",
+  "video_fps": 8,
+  "video_height": 360,
+  "video_width": 640,
+  "yamnet_threshold": 0.5,
+  "rtsp_transport": "udp"
+}
