@@ -16,7 +16,10 @@ import time
 import tkinter as tk
 from tkinter import messagebox, ttk
 
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.0.1"
+
+# Windows 下拉起 ffmpeg（控制台程序）时不弹黑框；非 Windows 为 0 无影响
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 APP_NAME = "宝宝哭声监控"
 
 # ---------- 路径 ----------
@@ -103,6 +106,9 @@ class MonitorApp:
         self.stop_event = threading.Event()
         self.last_alert = 0.0
         self.video_label_img = None
+        # 视频显示尺寸（跟随窗口变化，初始为配置分辨率）
+        self._disp_w = self.cfg.get("video_width", 640)
+        self._disp_h = self.cfg.get("video_height", 360)
 
         self._build_ui()
         self._poll()
@@ -127,6 +133,7 @@ class MonitorApp:
                                      background="black", foreground="gray",
                                      width=80)
         self.video_label.pack(fill="both", expand=True, padx=8, pady=4)
+        self.video_label.bind("<Configure>", self._on_video_resize)
 
         info = ttk.Frame(self.root, padding=(8, 0))
         info.pack(fill="x")
@@ -140,6 +147,10 @@ class MonitorApp:
         self.status_var = tk.StringVar(value="就绪")
         ttk.Label(self.root, textvariable=self.status_var, anchor="w",
                   padding=6).pack(fill="x", side="bottom")
+
+    def _on_video_resize(self, event):
+        if event.width > 10 and event.height > 10:
+            self._disp_w, self._disp_h = event.width, event.height
 
     def set_status(self, text, error=False):
         self.status_q.put((text, error))
@@ -159,12 +170,20 @@ class MonitorApp:
         except queue.Empty:
             pass
         try:
+            from PIL import Image, ImageTk
             img = self.frame_q.get_nowait()
-            self.video_label_img = img
-            self.video_label.config(image=img, text="")
+            # 按显示区域等比缩放（主线程做，tkinter 非线程安全）
+            lw, lh = self._disp_w, self._disp_h
+            if lw > 10 and lh > 10 and (img.width, img.height) != (lw, lh):
+                scale = min(lw / img.width, lh / img.height)
+                nw, nh = max(1, int(img.width * scale)), max(1, int(img.height * scale))
+                img = img.resize((nw, nh), Image.BILINEAR)
+            photo = ImageTk.PhotoImage(img)
+            self.video_label_img = photo
+            self.video_label.config(image=photo, text="")
         except queue.Empty:
             pass
-        self.root.after(200, self._poll)
+        self.root.after(100, self._poll)
 
     # ---------- 控制 ----------
     def start(self):
@@ -206,22 +225,23 @@ class MonitorApp:
                 cmd = [self.ffmpeg, "-rtsp_transport", "tcp", "-i", self.cfg["rtsp_video_url"],
                        "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{w}x{h}",
                        "-r", str(fps), "-an", "-"]
-                p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+                p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                     creationflags=_NO_WINDOW)
                 self.set_status("视频流已连接")
                 while self.running and not self.stop_event.is_set():
                     raw = p.stdout.read(frame_bytes)
                     if len(raw) < frame_bytes:
                         break
                     img = Image.frombytes("RGB", (w, h), raw, "raw", "BGR")
-                    photo = ImageTk.PhotoImage(img)
+                    # PIL Image 跨线程传递安全；PhotoImage 必须在主线程创建（tkinter 非线程安全）
                     try:
-                        self.frame_q.put_nowait(photo)
+                        self.frame_q.put_nowait(img)
                     except queue.Full:
                         try:
                             self.frame_q.get_nowait()
                         except queue.Empty:
                             pass
-                        self.frame_q.put_nowait(photo)
+                        self.frame_q.put_nowait(img)
                 p.terminate()
             except Exception as e:  # noqa: BLE001
                 logging.warning("视频流异常: %s", e)
@@ -241,7 +261,8 @@ class MonitorApp:
                 cmd = [self.ffmpeg, "-rtsp_transport", "tcp", "-i", self.cfg["rtsp_audio_url"],
                        "-vn", "-f", "s16le", "-ac", "1", "-ar", str(SAMPLE_RATE),
                        "-acodec", "pcm_s16le", "-"]
-                p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+                p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                     creationflags=_NO_WINDOW)
                 self.audio_label.config(text="音频流：已连接")
                 self.set_status("监听中…")
                 while self.running and not self.stop_event.is_set():
@@ -271,7 +292,8 @@ class MonitorApp:
                 cmd = [self.ffmpeg, "-rtsp_transport", "tcp", "-i", self.cfg["rtsp_audio_url"],
                        "-vn", "-f", "s16le", "-ac", "1", "-ar", "16000",
                        "-acodec", "pcm_s16le", "-t", "4", "-"]
-                p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+                p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                     creationflags=_NO_WINDOW)
                 data = p.stdout.read()
                 p.wait(timeout=10)
                 if len(data) > 16000:
@@ -282,7 +304,7 @@ class MonitorApp:
                     messagebox.showinfo("自检", "音频流正常！\n\n4 秒收到 %d 字节，峰值 %.3f。\n在摄像头旁拍手，峰值会明显跳动。" % (len(data), peak))
                 else:
                     self.set_status("音频流无数据", error=True)
-                    messagebox.showwarning("自检", "连上了但没收到音频数据。\n\n检查摄像头 Web 后台的 RTSP Audio 开关是否打开。")
+                    messagebox.showwarning("自检", "连上了但没收到音频数据。\n\n检查摄像头后台的音频（伴音）开关是否打开。")
             except Exception as e:  # noqa: BLE001
                 self.set_status("音频流连接失败", error=True)
                 messagebox.showerror("自检", "音频流连接失败：\n%s\n\n检查 config.json 里的地址和摄像头 IP。" % e)
