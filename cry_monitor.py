@@ -34,8 +34,8 @@ logging.basicConfig(
 )
 
 DEFAULT_CONFIG = {
-    "rtsp_video_url": "rtsp://192.168.0.107:554/ch0_0.h264",
-    "rtsp_audio_url": "rtsp://192.168.0.107:554/ch0_2.h264",
+    "rtsp_video_url": "rtsp://192.168.1.100:554/stream1",
+    "rtsp_audio_url": "rtsp://192.168.1.100:554/stream1",
     "energy_threshold": 0.02,
     "loud_seconds": 2.0,
     "yamnet_threshold": 0.5,
