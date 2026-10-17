@@ -38,7 +38,9 @@ logging.basicConfig(
 
 DEFAULT_CONFIG = {
     "rtsp_video_url": "rtsp://192.168.1.100:554/stream1",
-    "rtsp_audio_url": "rtsp://192.168.1.100:554/stream1",
+    # 音频地址：留空 = 与视频共用一路 RTSP（单会话，不额外占带宽）；
+    # 摄像头有纯音频子码流时可单独填（如小蚁刷机版的 ch0_1），此时走双会话但音频路只传音频
+    "rtsp_audio_url": "",
     "energy_threshold": 0.02,
     "loud_seconds": 2.0,
     "yamnet_threshold": 0.5,
@@ -104,6 +106,10 @@ class MonitorApp:
         self.alert_q = queue.Queue()
         self.frame_q = queue.Queue(maxsize=2)
         self.status_q = queue.Queue()
+        # 单会话模式：视频 worker 通过本地回环 TCP 把音频 PCM 交给音频线程，
+        # 音频线程不再拉第二路 RTSP，避免重复传输视频浪费带宽
+        self._audio_sock_q = queue.Queue()
+        self._shared_mode = True
         self.threads = []
         # ffmpeg 子进程登记：退出时统一杀掉，防止孤儿进程占住 RTSP 连接
         self.procs = []
@@ -271,6 +277,14 @@ class MonitorApp:
     def start(self):
         if self.running or not self.ffmpeg:
             return
+        video_url = (self.cfg.get("rtsp_video_url") or "").strip()
+        audio_url = (self.cfg.get("rtsp_audio_url") or "").strip()
+        # 单会话模式：音频地址为空或与视频地址相同 → 只拉一路 RTSP，
+        # 音频从视频流里分流出来，不重复传输视频、不多占带宽
+        self._shared_mode = (not audio_url) or (audio_url == video_url)
+        logging.info("启动模式: %s",
+                     "单会话（音视频共用一路 RTSP）" if self._shared_mode
+                     else "双会话（音频走独立子码流）")
         self.running = True
         self.stop_event.clear()
         self.btn_start.config(state="disabled")
@@ -290,6 +304,16 @@ class MonitorApp:
         for t in self.threads:
             t.join(timeout=3)
         self.threads = []
+        # 关闭共享音频 socket 残留
+        while True:
+            try:
+                s = self._audio_sock_q.get_nowait()
+                try:
+                    s.close()
+                except Exception:  # noqa: BLE001
+                    pass
+            except queue.Empty:
+                break
         self.btn_start.config(state="normal")
         self.btn_stop.config(state="disabled")
         self.video_label.config(image="", text="视频未启动")
@@ -303,9 +327,39 @@ class MonitorApp:
         self.stop()
         self.root.destroy()
 
+    def _accept_audio_sock(self, srv):
+        """后台线程：等 ffmpeg 的音频回环 TCP 连回来，交给音频线程。
+        流无音频轨时 accept 超时也不影响视频（视频早就开始播了）。"""
+        import socket
+        try:
+            a_sock, _ = srv.accept()
+            a_sock.settimeout(10)
+            # 丢掉上一轮重连残留的旧 socket，只保留最新
+            while True:
+                try:
+                    old = self._audio_sock_q.get_nowait()
+                    try:
+                        old.close()
+                    except Exception:  # noqa: BLE001
+                        pass
+                except queue.Empty:
+                    break
+            self._audio_sock_q.put(a_sock)
+        except socket.timeout:
+            logging.warning("音频回环 15 秒未连上（该流可能没有音频轨），本次只传视频")
+        except Exception as e:  # noqa: BLE001
+            logging.warning("音频回环异常: %s", e)
+        finally:
+            try:
+                srv.close()
+            except Exception:  # noqa: BLE001
+                pass
+
     # ---------- 视频 ----------
     def _video_loop(self):
-        from PIL import Image, ImageTk
+        import socket
+        from PIL import Image
+        from detection import SAMPLE_RATE
         w, h, fps = (self.cfg["video_width"], self.cfg["video_height"], self.cfg["video_fps"])
         video_url = (self.cfg.get("rtsp_video_url") or "").strip()
         if not video_url:
@@ -313,14 +367,38 @@ class MonitorApp:
             return
         frame_bytes = w * h * 3
         while self.running and not self.stop_event.is_set():
+            srv = None
             try:
-                cmd = [self.ffmpeg, "-rtsp_transport", "tcp", "-i", video_url,
-                       "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{w}x{h}",
-                       "-r", str(fps), "-an", "-"]
+                if self._shared_mode:
+                    # 单会话：一个 ffmpeg 拉一次流，视频走 stdout 管道，
+                    # 音频走本地回环 TCP 分流给音频线程（Windows 下无法双 stdout）
+                    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                    srv.bind(("127.0.0.1", 0))
+                    srv.listen(1)
+                    srv.settimeout(15)
+                    a_port = srv.getsockname()[1]
+                    cmd = [self.ffmpeg, "-rtsp_transport", "tcp", "-timeout", "10000000",
+                           "-i", video_url,
+                           "-map", "0:v", "-f", "rawvideo", "-pix_fmt", "bgr24",
+                           "-s", f"{w}x{h}", "-r", str(fps), "-an", "-",
+                           "-map", "0:a?", "-vn", "-f", "s16le", "-ac", "1",
+                           "-ar", str(SAMPLE_RATE), "-acodec", "pcm_s16le",
+                           f"tcp://127.0.0.1:{a_port}"]
+                else:
+                    cmd = [self.ffmpeg, "-rtsp_transport", "tcp", "-timeout", "10000000",
+                           "-i", video_url,
+                           "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{w}x{h}",
+                           "-r", str(fps), "-an", "-"]
                 p = self._register_proc(subprocess.Popen(
                     cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                     creationflags=_NO_WINDOW))
-                self.set_status("视频流已连接")
+                if self._shared_mode:
+                    # 音频回环 accept 放后台线程：流无音频轨时不阻塞视频启动
+                    threading.Thread(target=self._accept_audio_sock, args=(srv,),
+                                     daemon=True).start()
+                    srv = None  # 移交后不再由本线程关闭
+                self.set_status("视频流已连接" + ("（音视频共用一路）" if self._shared_mode else ""))
                 while self.running and not self.stop_event.is_set():
                     raw = p.stdout.read(frame_bytes)
                     if len(raw) < frame_bytes:
@@ -338,6 +416,12 @@ class MonitorApp:
                 self._close_proc(p)
             except Exception as e:  # noqa: BLE001
                 logging.warning("视频流异常: %s", e)
+            finally:
+                if srv is not None:
+                    try:
+                        srv.close()
+                    except Exception:  # noqa: BLE001
+                        pass
             if self.running and not self.stop_event.is_set():
                 self.set_status("视频流断开，5 秒后重连…（检查 config.json 里 rtsp_video_url 对不对）", error=True)
                 self.stop_event.wait(5)
@@ -346,13 +430,6 @@ class MonitorApp:
     def _audio_loop(self):
         import numpy as np
         from detection import CryDetector, SAMPLE_RATE, CHUNK_SECONDS
-        # 音频地址没填就用视频地址兜底（主码流一般自带音频）；都没填则不启动
-        audio_url = (self.cfg.get("rtsp_audio_url") or "").strip() \
-            or (self.cfg.get("rtsp_video_url") or "").strip()
-        if not audio_url:
-            self.audio_label.config(text="音频流：未配置")
-            self.set_status("音频流地址未配置，请检查 config.json", error=True)
-            return
         detector = CryDetector(self.cfg)
         self.mode_label.config(text="检测模式：" + detector.mode)
         # 实时播放：有声卡就播，无声卡只做检测不报错
@@ -366,9 +443,83 @@ class MonitorApp:
             logging.warning("音频播放不可用（只做检测）: %s", e)
             player = None
         chunk_bytes = int(SAMPLE_RATE * CHUNK_SECONDS) * 2
+
+        def handle_pcm(raw):
+            pcm = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+            if player is not None:
+                try:
+                    gain = 0.0 if self.mute_var.get() else self.volume_var.get() / 100.0
+                    player.write((pcm * gain).astype(np.float32))
+                except Exception:  # noqa: BLE001
+                    pass
+            triggered, info = detector.feed(pcm)
+            if triggered:
+                now = time.time()
+                if now - self.last_alert >= self.cfg["cooldown_seconds"]:
+                    self.last_alert = now
+                    logging.info("哭声触发: %s", info)
+                    self.alert_q.put(("🍼 宝宝哭声", "检测到哭声（%s），快去看一下" % info))
+
+        try:
+            if self._shared_mode:
+                self._audio_loop_shared(chunk_bytes, handle_pcm)
+            else:
+                self._audio_loop_split(chunk_bytes, handle_pcm)
+        finally:
+            if player is not None:
+                try:
+                    player.stop()
+                    player.close()
+                except Exception:  # noqa: BLE001
+                    pass
+
+    def _audio_loop_shared(self, chunk_bytes, handle_pcm):
+        """单会话模式：从视频 worker 的本地回环 TCP 读 PCM，不再拉第二路 RTSP。"""
+        import socket
+        self.audio_label.config(text="音频流：等待视频流…")
         while self.running and not self.stop_event.is_set():
             try:
-                cmd = [self.ffmpeg, "-rtsp_transport", "tcp", "-i", audio_url,
+                sock = self._audio_sock_q.get(timeout=1)
+            except queue.Empty:
+                continue
+            self.audio_label.config(text="音频流：已连接（与视频共用一路）")
+            self.set_status("监听中…")
+            buf = b""
+            try:
+                while self.running and not self.stop_event.is_set():
+                    try:
+                        data = sock.recv(65536)
+                    except socket.timeout:
+                        continue
+                    if not data:
+                        break  # 视频端重连或退出，等下一个 socket
+                    buf += data
+                    while len(buf) >= chunk_bytes:
+                        handle_pcm(buf[:chunk_bytes])
+                        buf = buf[chunk_bytes:]
+            except Exception as e:  # noqa: BLE001
+                logging.warning("共享音频流异常: %s", e)
+            finally:
+                try:
+                    sock.close()
+                except Exception:  # noqa: BLE001
+                    pass
+            if self.running and not self.stop_event.is_set():
+                self.audio_label.config(text="音频流：等待视频流重连…")
+
+    def _audio_loop_split(self, chunk_bytes, handle_pcm):
+        """双会话模式：音频地址是独立子码流（纯音频）时，自己拉一路 RTSP。
+        该路只传输音频，无视频带宽浪费。"""
+        from detection import SAMPLE_RATE
+        audio_url = (self.cfg.get("rtsp_audio_url") or "").strip()
+        if not audio_url:
+            self.audio_label.config(text="音频流：未配置")
+            self.set_status("音频流地址未配置，请检查 config.json", error=True)
+            return
+        while self.running and not self.stop_event.is_set():
+            try:
+                cmd = [self.ffmpeg, "-rtsp_transport", "tcp", "-timeout", "10000000",
+                       "-i", audio_url,
                        "-vn", "-f", "s16le", "-ac", "1", "-ar", str(SAMPLE_RATE),
                        "-acodec", "pcm_s16le", "-"]
                 p = self._register_proc(subprocess.Popen(
@@ -380,32 +531,13 @@ class MonitorApp:
                     raw = p.stdout.read(chunk_bytes)
                     if len(raw) < chunk_bytes:
                         break
-                    pcm = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
-                    if player is not None:
-                        try:
-                            gain = 0.0 if self.mute_var.get() else self.volume_var.get() / 100.0
-                            player.write((pcm * gain).astype(np.float32))
-                        except Exception:  # noqa: BLE001
-                            pass
-                    triggered, info = detector.feed(pcm)
-                    if triggered:
-                        now = time.time()
-                        if now - self.last_alert >= self.cfg["cooldown_seconds"]:
-                            self.last_alert = now
-                            logging.info("哭声触发: %s", info)
-                            self.alert_q.put(("🍼 宝宝哭声", "检测到哭声（%s），快去看一下" % info))
+                    handle_pcm(raw)
                 self._close_proc(p)
             except Exception as e:  # noqa: BLE001
                 logging.warning("音频流异常: %s", e)
             if self.running and not self.stop_event.is_set():
                 self.audio_label.config(text="音频流：重连中…")
                 self.stop_event.wait(5)
-        if player is not None:
-            try:
-                player.stop()
-                player.close()
-            except Exception:  # noqa: BLE001
-                pass
 
     # ---------- 自检 ----------
     def selftest_audio(self):
@@ -417,7 +549,8 @@ class MonitorApp:
                 return
             self.set_status("正在检测音频流…")
             try:
-                cmd = [self.ffmpeg, "-rtsp_transport", "tcp", "-i", audio_url,
+                cmd = [self.ffmpeg, "-rtsp_transport", "tcp", "-timeout", "10000000",
+                       "-i", audio_url,
                        "-vn", "-f", "s16le", "-ac", "1", "-ar", "16000",
                        "-acodec", "pcm_s16le", "-t", "4", "-"]
                 p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
