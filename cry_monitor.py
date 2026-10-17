@@ -16,7 +16,7 @@ import time
 import tkinter as tk
 from tkinter import messagebox, ttk
 
-APP_VERSION = "1.0.1"
+APP_VERSION = "1.0.2"
 
 # Windows 下拉起 ffmpeg（控制台程序）时不弹黑框；非 Windows 为 0 无影响
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -219,10 +219,14 @@ class MonitorApp:
     def _video_loop(self):
         from PIL import Image, ImageTk
         w, h, fps = (self.cfg["video_width"], self.cfg["video_height"], self.cfg["video_fps"])
+        video_url = (self.cfg.get("rtsp_video_url") or "").strip()
+        if not video_url:
+            self.set_status("视频流地址未配置，请检查 config.json", error=True)
+            return
         frame_bytes = w * h * 3
         while self.running and not self.stop_event.is_set():
             try:
-                cmd = [self.ffmpeg, "-rtsp_transport", "tcp", "-i", self.cfg["rtsp_video_url"],
+                cmd = [self.ffmpeg, "-rtsp_transport", "tcp", "-i", video_url,
                        "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{w}x{h}",
                        "-r", str(fps), "-an", "-"]
                 p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
@@ -246,19 +250,26 @@ class MonitorApp:
             except Exception as e:  # noqa: BLE001
                 logging.warning("视频流异常: %s", e)
             if self.running:
-                self.set_status("视频流断开，5 秒后重连…", error=True)
+                self.set_status("视频流断开，5 秒后重连…（检查 config.json 里 rtsp_video_url 对不对）", error=True)
                 time.sleep(5)
 
     # ---------- 音频检测 ----------
     def _audio_loop(self):
         import numpy as np
         from detection import CryDetector, SAMPLE_RATE, CHUNK_SECONDS
+        # 音频地址没填就用视频地址兜底（主码流一般自带音频）；都没填则不启动
+        audio_url = (self.cfg.get("rtsp_audio_url") or "").strip() \
+            or (self.cfg.get("rtsp_video_url") or "").strip()
+        if not audio_url:
+            self.audio_label.config(text="音频流：未配置")
+            self.set_status("音频流地址未配置，请检查 config.json", error=True)
+            return
         detector = CryDetector(self.cfg)
         self.mode_label.config(text="检测模式：" + detector.mode)
         chunk_bytes = int(SAMPLE_RATE * CHUNK_SECONDS) * 2
         while self.running and not self.stop_event.is_set():
             try:
-                cmd = [self.ffmpeg, "-rtsp_transport", "tcp", "-i", self.cfg["rtsp_audio_url"],
+                cmd = [self.ffmpeg, "-rtsp_transport", "tcp", "-i", audio_url,
                        "-vn", "-f", "s16le", "-ac", "1", "-ar", str(SAMPLE_RATE),
                        "-acodec", "pcm_s16le", "-"]
                 p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
@@ -287,9 +298,14 @@ class MonitorApp:
     # ---------- 自检 ----------
     def selftest_audio(self):
         def _run():
+            audio_url = (self.cfg.get("rtsp_audio_url") or "").strip() \
+                or (self.cfg.get("rtsp_video_url") or "").strip()
+            if not audio_url:
+                messagebox.showinfo("自检", "未配置音频流地址，请先在 config.json 里填写 rtsp 地址。")
+                return
             self.set_status("正在检测音频流…")
             try:
-                cmd = [self.ffmpeg, "-rtsp_transport", "tcp", "-i", self.cfg["rtsp_audio_url"],
+                cmd = [self.ffmpeg, "-rtsp_transport", "tcp", "-i", audio_url,
                        "-vn", "-f", "s16le", "-ac", "1", "-ar", "16000",
                        "-acodec", "pcm_s16le", "-t", "4", "-"]
                 p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
