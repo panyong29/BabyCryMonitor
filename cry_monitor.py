@@ -112,6 +112,7 @@ class MonitorApp:
         self.last_alert = 0.0
         self.video_label_img = None
         self._last_frame = None  # 上一帧 PIL 图，供窗口缩放时立即重绘
+        self._resize_after_id = None  # 缩放防抖计时器
         # 视频显示尺寸（跟随窗口变化，初始为配置分辨率）
         self._disp_w = self.cfg.get("video_width", 640)
         self._disp_h = self.cfg.get("video_height", 360)
@@ -165,7 +166,13 @@ class MonitorApp:
     def _on_video_resize(self, event):
         if event.width > 10 and event.height > 10:
             self._disp_w, self._disp_h = event.width, event.height
-            self._redraw_video()  # 窗口一变就用上一帧立即重绘，不等轮询
+            # 防抖：动画/拖拽中频繁触发时，只在停稳 50ms 后重绘一次
+            if self._resize_after_id is not None:
+                try:
+                    self.root.after_cancel(self._resize_after_id)
+                except Exception:  # noqa: BLE001
+                    pass
+            self._resize_after_id = self.root.after(50, self._redraw_video)
 
     def _redraw_video(self):
         """主线程：把上一帧按显示尺寸等比缩放后显示。"""
