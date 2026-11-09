@@ -27,6 +27,16 @@ jobs:
 
       # 精简版：exe 里不再打包 ffmpeg 和 YAMNet 模型（见 README 精简版一节），
       # 只打包类别映射表（很小）；ffmpeg 和模型由使用者自己下载、放 exe 旁。
+      # 真正瘦身：imageio-ffmpeg 包自带 ffmpeg.exe，PyInstaller 会把它当包数据
+      # 一起收进 exe（v2.1.0 的 72.9MB 里它占了 38.7MB）。构建前删掉，
+      # 之后 ffmpeg 必须由使用者自己下载（README 安装一节）。
+      - name: Strip bundled ffmpeg binary
+        shell: pwsh
+        run: |
+          $pkg = python -c "import imageio_ffmpeg, os; print(os.path.dirname(imageio_ffmpeg.__file__))"
+          Get-ChildItem -Path "$pkg\binaries" -Filter *.exe -ErrorAction SilentlyContinue | Remove-Item -Force
+          if (Test-Path "$pkg\binaries") { Get-ChildItem -Path "$pkg\binaries" }
+
       - name: Build EXE
         shell: pwsh
         run: >
