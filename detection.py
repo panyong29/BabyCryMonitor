@@ -19,12 +19,18 @@ BABY_CRY_LABEL = "Baby cry, infant cry"
 
 
 def _asset(name):
-    """按优先级找打包资源：_MEIPASS > 本文件目录 > 当前工作目录。"""
+    """按优先级找打包资源：_MEIPASS > exe 所在目录（精简版：用户自己下载的
+    资源放 exe 旁）> 本文件目录 > 当前工作目录。"""
     rel = os.path.join("assets", name)
     search = []
     meipass = getattr(sys, "_MEIPASS", None)
     if meipass:
         search.append(os.path.join(meipass, rel))
+    if getattr(sys, "frozen", False):
+        # 精简版：yamnet.tflite 由使用者自己下载，放 exe 旁的 assets/ 里
+        exe_dir = os.path.dirname(sys.executable)
+        search.append(os.path.join(exe_dir, rel))
+        search.append(os.path.join(exe_dir, name))
     search.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), rel))
     search.append(os.path.join(os.getcwd(), rel))
     for p in search:
@@ -168,8 +174,8 @@ class MotionDetector:
     输入：每帧一张小灰度图（调用方先把 640x360 帧缩到 160x90 左右，省 CPU）。
     输出事件：None / "motion"（持续动作）/ "vigorous"（剧烈动作）。
     开灯、红外夜视切换这类整幅亮度跳变会直接跳过该帧，不误报。
-    注意：它只能报"动了"——吐奶、尿湿在画面上几乎看不见，
-    靠它检不出来（见 README 动作监测一节的如实说明）。
+    注意：它只能报"动了"。吐奶/尿湿是"一直不走的变化"，不是动作，
+    归 StainDetector（持续变化监测）管，见下。
     """
 
     def __init__(self, cfg):
@@ -186,7 +192,7 @@ class MotionDetector:
         self._last_t = None
         self.motion_run = 0.0
         self.high_run = 0.0
-        self.last_alert = 0.0
+        self.last_alert = float("-inf")  # 从未报过；不用 0.0，避免 now 很小时被冷却挡住
         self.last_score = 0.0
         self.last_state = "quiet"  # quiet | motion | vigorous | lighting
 
@@ -266,3 +272,136 @@ class MotionDetector:
         self.last_state = ("vigorous" if self.high_run > 0
                            else "motion" if self.motion_run > 0 else "quiet")
         return event, score, self.last_state
+
+
+class StainDetector:
+    """持续变化监测（吐奶/尿湿试验）：复用婴儿床区域（motion_roi，不再框选），
+    白天才测；夜里红外画面是灰度，饱和度低，直接跳过。
+
+    原理：跟几分钟前的参考帧比，区域内新出现且一直不走的亮斑判"疑似吐奶"、
+    暗斑判"疑似尿湿"。跟动作检测不同：奶渍/水渍出现后就不动，帧差抓不到，
+    只能靠"跟旧参考比 + 持续确认"。
+    试验模式（默认开）：只记日志、存截图，不弹窗；跑几天看误报率再决定
+    要不要开提醒。注意：宝宝挪位置后身体停在新地方，也会形成一块一直
+    不走的亮/暗斑，可能误报——试验期靠截图人工判断。
+    """
+
+    def __init__(self, cfg):
+        self.enabled = bool(cfg.get("stain_enabled", True))
+        self.roi = _parse_roi(cfg.get("motion_roi"))
+        self.bright_threshold = int(cfg.get("stain_bright_threshold", 25))
+        self.dark_threshold = int(cfg.get("stain_dark_threshold", 25))
+        self.min_fraction = float(cfg.get("stain_min_fraction", 0.005))
+        self.sustain = float(cfg.get("stain_sustain_seconds", 60.0))
+        self.ref_interval = float(cfg.get("stain_ref_interval_seconds", 600.0))
+        self.cooldown = float(cfg.get("stain_cooldown_seconds", 600.0))
+        self.saturation_threshold = float(cfg.get("stain_saturation_threshold", 8.0))
+        self.brightness_jump = float(cfg.get("stain_brightness_jump", 20))
+        self.trial_mode = bool(cfg.get("stain_trial_mode", True))
+        self.ref = None
+        self._ref_time = 0.0
+        self._cand_kind = None
+        self._cand_start = 0.0
+        self.last_alert = float("-inf")  # 从未报过；不用 0.0，避免 now 很小时被冷却挡住
+        self.last_score = 0.0
+        self.last_state = "idle"  # idle | watching | candidate | lighting
+
+    def set_roi(self, roi):
+        self.roi = _parse_roi(roi)
+        self.reset()
+
+    def reset(self):
+        self.ref = None
+        self._ref_time = 0.0
+        self._cand_kind = None
+        self._cand_start = 0.0
+        self.last_state = "idle"
+
+    @staticmethod
+    def daytime_score(bgr):
+        """色彩分：像素通道间最大差的均值。白天彩色画面高，夜里红外灰度接近 0。
+        输入 160x90 左右的小彩色图（RGB 或 BGR 都行，通道顺序不影响最大差）。"""
+        bgr = np.asarray(bgr)
+        if bgr.ndim != 3 or bgr.shape[2] < 3 or bgr.size == 0:
+            return 0.0
+        spread = bgr.max(axis=2).astype(np.int16) - bgr.min(axis=2).astype(np.int16)
+        return float(spread.mean())
+
+    def is_day(self, bgr):
+        return self.daytime_score(bgr) >= self.saturation_threshold
+
+    def _region(self, gray):
+        """按 ROI 裁一块；无 ROI 返回整幅。"""
+        if not self.roi:
+            return gray
+        h, w = gray.shape[:2]
+        x0 = max(0, int(self.roi[0] * w))
+        y0 = max(0, int(self.roi[1] * h))
+        x1 = max(x0 + 1, int(self.roi[2] * w))
+        y1 = max(y0 + 1, int(self.roi[3] * h))
+        return gray[y0:y1, x0:x1]
+
+    def feed(self, gray, now=None):
+        """喂一帧小灰度图（2D uint8 ndarray，白天彩色画面的灰度版）。
+        返回 (event, score, state)：event 为 None / "spit_up" / "wet"；
+        score 是 ROI 内变化像素占比；state 是当前状态。"""
+        if not self.enabled:
+            return None, 0.0, "idle"
+        gray = np.asarray(gray)
+        if gray.ndim != 2 or gray.size == 0:
+            return None, 0.0, "idle"
+        if now is None:
+            now = time.time()
+        if self.ref is None or self.ref.shape != gray.shape:
+            self.ref = gray.copy()
+            self._ref_time = now
+            self._cand_kind = None
+            self.last_state = "watching"
+            return None, 0.0, "watching"
+        # 整幅亮度跳变（开灯、拉窗帘）：以当前帧为新参考，不误报
+        mean_shift = abs(float(gray.mean()) - float(self.ref.mean()))
+        if mean_shift > self.brightness_jump:
+            self.ref = gray.copy()
+            self._ref_time = now
+            self._cand_kind = None
+            self.last_state = "lighting"
+            return None, 0.0, "lighting"
+        # 无可疑变化超过 10 分钟：刷新参考帧，跟上被子、光线这类慢变化
+        if self._cand_kind is None and now - self._ref_time > self.ref_interval:
+            self.ref = gray.copy()
+            self._ref_time = now
+            self.last_state = "watching"
+            return None, 0.0, "watching"
+        region = self._region(gray)
+        ref_region = self._region(self.ref)
+        diff = region.astype(np.int16) - ref_region.astype(np.int16)
+        bright_frac = float((diff > self.bright_threshold).mean())
+        dark_frac = float((diff < -self.dark_threshold).mean())
+        score = max(bright_frac, dark_frac)
+        self.last_score = score
+        kind = None
+        if bright_frac >= self.min_fraction and bright_frac >= dark_frac:
+            kind = "spit_up"
+        elif dark_frac >= self.min_fraction:
+            kind = "wet"
+        if kind is None:
+            self._cand_kind = None
+            self.last_state = "watching"
+            return None, score, "watching"
+        if self._cand_kind != kind:
+            self._cand_kind = kind
+            self._cand_start = now
+            self.last_state = "candidate"
+            return None, score, "candidate"
+        self.last_state = "candidate"
+        if now - self._cand_start < self.sustain:
+            return None, score, "candidate"
+        if now - self.last_alert < self.cooldown:
+            return None, score, "candidate"
+        # 持续够久：报一次，并把当前画面吸进参考帧，避免同一块渍反复报
+        self.last_alert = now
+        self.ref = gray.copy()
+        self._ref_time = now
+        self._cand_kind = None
+        self.last_state = "watching"
+        return kind, score, kind
