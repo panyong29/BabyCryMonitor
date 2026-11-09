@@ -4,6 +4,8 @@
 检测到哭声后 Windows 右下角弹窗提醒。
 
 检测：能量门 -> YAMNet AI 确认（缺模型时自动降级为纯音量模式）。
+动作：帧差法看婴儿床区域，持续动作 / 剧烈动作弹窗（只能报"动了"，
+认不出吐奶、尿湿——奶和尿在画面上几乎看不见）。
 """
 import json
 import logging
@@ -16,7 +18,7 @@ import time
 import tkinter as tk
 from tkinter import messagebox, ttk
 
-APP_VERSION = "1.0.3"
+APP_VERSION = "2.0.0"
 
 # Windows 下拉起 ffmpeg（控制台程序）时不弹黑框；非 Windows 为 0 无影响
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -52,6 +54,17 @@ DEFAULT_CONFIG = {
     "video_width": 640,
     "video_height": 360,
     "video_fps": 8,
+    # 动作监测（帧差法，只看婴儿床区域）：motion_roi 为 [x0, y0, x1, y1]
+    # 相对坐标（0~1），留空 = 看整幅画面；在画面上拖选后自动写入
+    "motion_enabled": True,
+    "motion_roi": None,
+    "motion_threshold": 0.03,
+    "motion_high_threshold": 0.12,
+    "motion_pixel_diff": 25,
+    "motion_sustain_seconds": 2.0,
+    "motion_high_sustain_seconds": 1.0,
+    "motion_cooldown_seconds": 60,
+    "motion_brightness_jump": 20,
 }
 
 
@@ -104,10 +117,13 @@ class MonitorApp:
             self.ffmpeg = find_ffmpeg()
         except Exception as e:  # noqa: BLE001
             logging.error("ffmpeg 定位失败: %s", e)
+        if self.ffmpeg:
+            logging.info("ffmpeg: %s", self.ffmpeg)
 
         self.alert_q = queue.Queue()
         self.frame_q = queue.Queue(maxsize=2)
         self.status_q = queue.Queue()
+        self.motion_q = queue.Queue()
         # 单会话模式：视频 worker 通过本地回环 TCP 把音频 PCM 交给音频线程，
         # 音频线程不再拉第二路 RTSP，避免重复传输视频浪费带宽
         self._audio_sock_q = queue.Queue()
@@ -120,6 +136,16 @@ class MonitorApp:
         self.last_alert = 0.0
         self.last_audio_time = 0.0   # 主路最近一次收到音频块的时间
         self.last_audio_peak = 0.0   # 主路最近一块音频的峰值
+        # 动作监测：视频线程喂帧，主线程经 motion_q 更新状态栏
+        try:
+            from detection import MotionDetector
+            self.motion = MotionDetector(self.cfg)
+        except Exception as e:  # noqa: BLE001
+            logging.warning("动作检测初始化失败（不影响哭声监测）: %s", e)
+            self.motion = None
+        self._roi_arming = False   # 框选模式：下一次拖选即定婴儿床区域
+        self._roi_drag = None      # 拖选中：(x0, y0, x1, y1) 显示像素
+        self._last_motion_ui = 0.0  # 动作状态栏刷新节流
         self.video_label_img = None
         self._last_frame = None  # 上一帧 PIL 图，供窗口缩放时立即重绘
         self._resize_after_id = None  # 缩放防抖计时器
@@ -145,6 +171,8 @@ class MonitorApp:
         self.btn_stop.pack(side="left", padx=4)
         ttk.Button(top, text="测试弹窗", command=lambda: notify("🍼 测试", "弹窗正常")).pack(side="left", padx=4)
         ttk.Button(top, text="检测音频流", command=self.selftest_audio).pack(side="left", padx=4)
+        self.btn_roi = ttk.Button(top, text="框选婴儿床", command=self._toggle_roi_arming)
+        self.btn_roi.pack(side="left", padx=4)
         self.autostart_var = tk.BooleanVar(value=self._autostart_enabled())
         ttk.Checkbutton(top, text="开机自启", variable=self.autostart_var,
                         command=self._toggle_autostart).pack(side="right", padx=4)
@@ -158,6 +186,11 @@ class MonitorApp:
                                      background="black", foreground="gray")
         self.video_label.place(relx=0.5, rely=0.5, anchor="center")
         self.video_frame.bind("<Configure>", self._on_video_resize)
+        # 婴儿床区域框选：点"框选婴儿床"后在画面上拖出方框；右键清除区域
+        self.video_label.bind("<ButtonPress-1>", self._roi_press)
+        self.video_label.bind("<B1-Motion>", self._roi_drag_move)
+        self.video_label.bind("<ButtonRelease-1>", self._roi_release)
+        self.video_label.bind("<Button-3>", self._roi_clear)
 
         info = ttk.Frame(self.root, padding=(8, 0))
         info.pack(fill="x")
@@ -172,6 +205,15 @@ class MonitorApp:
                                       variable=self.volume_var, length=110)
         self.volume_scale.pack(side="left")
         ttk.Checkbutton(info, text="静音", variable=self.mute_var).pack(side="left", padx=4)
+
+        info2 = ttk.Frame(self.root, padding=(8, 0))
+        info2.pack(fill="x")
+        self.motion_label = ttk.Label(info2, text="动作：--")
+        self.motion_label.pack(side="left", padx=4)
+        roi_text = ("婴儿床区域：已设置" if self.cfg.get("motion_roi")
+                    else "婴儿床区域：未设置（看整幅画面）")
+        self.roi_label = ttk.Label(info2, text=roi_text)
+        self.roi_label.pack(side="left", padx=12)
 
         self.status_var = tk.StringVar(value="就绪")
         ttk.Label(self.root, textvariable=self.status_var, anchor="w",
@@ -200,9 +242,73 @@ class MonitorApp:
             nw, nh = max(1, int(img.width * scale)), max(1, int(img.height * scale))
             if (nw, nh) != img.size:
                 img = img.resize((nw, nh), Image.BILINEAR)
+        # 婴儿床区域红框（画在副本上，别污染存着的上一帧）
+        if self.motion is not None and (self.motion.roi or self._roi_drag):
+            from PIL import ImageDraw
+            img = img.copy()
+            w, h = img.size
+            if self._roi_drag is not None:
+                x0, y0, x1, y1 = self._roi_drag
+            else:
+                r = self.motion.roi
+                x0, y0, x1, y1 = r[0] * w, r[1] * h, r[2] * w, r[3] * h
+            ImageDraw.Draw(img).rectangle([x0, y0, x1, y1],
+                                          outline=(255, 60, 60), width=2)
         photo = ImageTk.PhotoImage(img)
         self.video_label_img = photo
         self.video_label.config(image=photo, text="")
+
+    # ---------- 婴儿床区域框选 ----------
+    def _toggle_roi_arming(self):
+        self._roi_arming = not self._roi_arming
+        self.btn_roi.config(text="正在框选…" if self._roi_arming else "框选婴儿床")
+        self.set_status("在画面上拖出婴儿床的方框" if self._roi_arming else "已取消框选")
+
+    def _roi_press(self, event):
+        if not self._roi_arming or self._last_frame is None:
+            return
+        self._roi_drag = (event.x, event.y, event.x, event.y)
+
+    def _roi_drag_move(self, event):
+        if self._roi_drag is None:
+            return
+        x0, y0, _, _ = self._roi_drag
+        self._roi_drag = (x0, y0, event.x, event.y)
+        self._redraw_video()
+
+    def _roi_release(self, event):
+        if self._roi_drag is None:
+            return
+        x0, y0, _, _ = self._roi_drag
+        x1, y1 = event.x, event.y
+        self._roi_drag = None
+        self._roi_arming = False
+        self.btn_roi.config(text="框选婴儿床")
+        lw, lh = self.video_label.winfo_width(), self.video_label.winfo_height()
+        if lw < 10 or lh < 10:
+            self.set_status("框选失败：画面尺寸异常", error=True)
+            return
+        roi = [min(x0, x1) / lw, min(y0, y1) / lh, max(x0, x1) / lw, max(y0, y1) / lh]
+        if self.motion is not None:
+            self.motion.set_roi(roi)
+            if self.motion.roi is None:
+                self.set_status("框选区域太小，已忽略（仍看整幅画面）", error=True)
+                return
+            self.cfg["motion_roi"] = self.motion.roi
+        else:
+            self.cfg["motion_roi"] = roi
+        self._save_config()
+        self.roi_label.config(text="婴儿床区域：已设置")
+        self.set_status("婴儿床区域已设置，只看框里的动静")
+
+    def _roi_clear(self, event):
+        if self.motion is not None:
+            self.motion.set_roi(None)
+        self.cfg["motion_roi"] = None
+        self._save_config()
+        self.roi_label.config(text="婴儿床区域：未设置（看整幅画面）")
+        self._redraw_video()
+        self.set_status("婴儿床区域已清除，恢复看整幅画面")
 
     # ---------- 子进程管理（防孤儿进程占住 RTSP） ----------
     def _register_proc(self, p):
@@ -261,6 +367,12 @@ class MonitorApp:
             while True:
                 text, error = self.status_q.get_nowait()
                 self.status_var.set(text)
+        except queue.Empty:
+            pass
+        try:
+            while True:
+                text = self.motion_q.get_nowait()
+                self.motion_label.config(text=text)
         except queue.Empty:
             pass
         try:
@@ -324,6 +436,9 @@ class MonitorApp:
         self.video_label_img = None
         self._last_frame = None
         self.audio_label.config(text="音频流：--")
+        self.motion_label.config(text="动作：--")
+        if self.motion is not None:
+            self.motion.reset()
         self.set_status("已停止")
 
     def on_close(self):
@@ -403,11 +518,14 @@ class MonitorApp:
                                      daemon=True).start()
                     srv = None  # 移交后不再由本线程关闭
                 self.set_status("视频流已连接" + ("（音视频共用一路）" if self._shared_mode else ""))
+                if self.motion is not None:
+                    self.motion.reset()  # 重连后画面基准变了，丢掉上一路的参考帧
                 while self.running and not self.stop_event.is_set():
                     raw = p.stdout.read(frame_bytes)
                     if len(raw) < frame_bytes:
                         break
                     img = Image.frombytes("RGB", (w, h), raw, "raw", "BGR")
+                    self._motion_feed(img)
                     # PIL Image 跨线程传递安全；PhotoImage 必须在主线程创建（tkinter 非线程安全）
                     try:
                         self.frame_q.put_nowait(img)
@@ -429,6 +547,33 @@ class MonitorApp:
             if self.running and not self.stop_event.is_set():
                 self.set_status("视频流断开，5 秒后重连…（检查 config.json 里 rtsp_video_url 对不对）", error=True)
                 self.stop_event.wait(5)
+
+    def _motion_feed(self, img):
+        """视频线程：每帧喂动作检测（灰度缩略图），事件进 alert_q，
+        状态进 motion_q 由主线程显示。检测本身异常不影响视频和哭声监测。"""
+        if self.motion is None or not self.motion.enabled:
+            return
+        try:
+            from PIL import Image as _Image
+            import numpy as np
+            small = img.convert("L").resize((160, 90), _Image.BILINEAR)
+            event, score, state = self.motion.feed(np.asarray(small, dtype=np.uint8))
+            if event == "motion":
+                logging.info("动作提醒：婴儿床区域持续动作（强度 %.2f）", score)
+                self.alert_q.put(("👶 宝宝在动", "婴儿床区域持续有动作，快去看一下"))
+            elif event == "vigorous":
+                logging.info("剧烈动作提醒：婴儿床区域动作突然加剧（强度 %.2f）", score)
+                self.alert_q.put(("👶 宝宝动得很厉害", "婴儿床区域动作突然加剧，快去看一下"))
+            now = time.time()
+            if now - self._last_motion_ui >= 0.5:
+                self._last_motion_ui = now
+                text = {"quiet": "动作：安静",
+                        "motion": "动作：有动作",
+                        "vigorous": "动作：剧烈动作",
+                        "lighting": "动作：光线变化（已忽略）"}.get(state, "动作：--")
+                self.motion_q.put(text)
+        except Exception as e:  # noqa: BLE001
+            logging.warning("动作检测异常: %s", e)
 
     # ---------- 音频检测 + 实时播放 ----------
     def _audio_loop(self):
@@ -621,7 +766,61 @@ class MonitorApp:
             self.autostart_var.set(self._autostart_enabled())
 
 
+# ---------- 单实例保护 ----------
+# Windows 命名互斥体：第二个进程启动时发现互斥体已存在 → 提示后直接退出。
+# 互斥体是内核对象：进程崩溃或被任务管理器杀掉时，系统自动释放，不会留下"死锁"。
+# 名字不带 Global\ 前缀 → 会话级命名空间，普通用户权限即可用，无需管理员。
+_single_instance_mutex = None  # 持有句柄直到进程退出，防止被 GC 提前释放
+
+
+def _acquire_single_instance():
+    """尝试成为唯一实例。返回 True=本进程是唯一实例可继续启动；False=已有实例在运行。"""
+    if sys.platform != "win32":
+        return True  # 非 Windows 不做限制
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.windll.kernel32
+        kernel32.CreateMutexW.restype = wintypes.HANDLE
+        kernel32.CreateMutexW.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR]
+        kernel32.GetLastError.restype = wintypes.DWORD
+
+        mutex = kernel32.CreateMutexW(None, False, "BabyCryMonitor_SingleInstance")
+        if not mutex:
+            logging.warning("单实例互斥体创建失败，跳过单实例检查")
+            return True  # 拿不到互斥体也不拦用户
+        already_running = (kernel32.GetLastError() == 183)  # ERROR_ALREADY_EXISTS
+        if already_running:
+            kernel32.CloseHandle(mutex)
+            return False
+        global _single_instance_mutex
+        _single_instance_mutex = mutex
+        return True
+    except Exception as e:  # noqa: BLE001
+        logging.warning("单实例检查异常，跳过: %s", e)
+        return True  # 检查本身出问题也不拦用户
+
+
+def _alert_already_running():
+    """已有实例运行时弹个置顶提示后退出（不静默退出，避免用户以为没点开而继续连点）。"""
+    root = tk.Tk()
+    root.withdraw()
+    root.attributes("-topmost", True)
+    messagebox.showinfo(
+        APP_NAME,
+        "宝宝哭声监控已经在运行了。\n\n"
+        "请勿重复双击——程序启动要解压+过杀毒扫描，第一次打开本来就慢，\n"
+        "多点几次只会越点越慢。\n\n"
+        "如需重启：先在任务管理器结束掉旧的 BabyCryMonitor.exe，再双击打开。",
+    )
+    root.destroy()
+
+
 def main():
+    if not _acquire_single_instance():
+        _alert_already_running()
+        return
     root = tk.Tk()
     MonitorApp(root)
     root.mainloop()
