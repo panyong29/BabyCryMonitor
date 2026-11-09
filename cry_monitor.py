@@ -4,8 +4,11 @@
 检测到哭声后 Windows 右下角弹窗提醒。
 
 检测：能量门 -> YAMNet AI 确认（缺模型时自动降级为纯音量模式）。
-动作：帧差法看婴儿床区域，持续动作 / 剧烈动作弹窗（只能报"动了"，
-认不出吐奶、尿湿——奶和尿在画面上几乎看不见）。
+动作：帧差法看婴儿床区域，持续动作 / 剧烈动作弹窗（只能报"动了"）。
+污渍（试验）：跟几分钟前的画面比，婴儿床区域里新出现且一直不走的
+亮斑判疑似吐奶、暗斑判疑似尿湿；复用婴儿床区域，不再框选；只在
+白天测（夜里红外画面是灰度，直接跳过）；试验期只记日志、存截图，
+不弹窗。
 """
 import json
 import logging
@@ -18,7 +21,7 @@ import time
 import tkinter as tk
 from tkinter import messagebox, ttk
 
-APP_VERSION = "2.0.0"
+APP_VERSION = "2.1.0"
 
 # Windows 下拉起 ffmpeg（控制台程序）时不弹黑框；非 Windows 为 0 无影响
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -65,6 +68,18 @@ DEFAULT_CONFIG = {
     "motion_high_sustain_seconds": 1.0,
     "motion_cooldown_seconds": 60,
     "motion_brightness_jump": 20,
+    # 污渍监测（吐奶/尿湿试验）：复用 motion_roi，不再框选；只在白天测
+    # （夜里红外画面是灰度，饱和度低，直接跳过）；试验期只记日志、存截图
+    "stain_enabled": True,
+    "stain_bright_threshold": 25,
+    "stain_dark_threshold": 25,
+    "stain_min_fraction": 0.005,
+    "stain_sustain_seconds": 60.0,
+    "stain_ref_interval_seconds": 600.0,
+    "stain_cooldown_seconds": 600.0,
+    "stain_saturation_threshold": 8.0,
+    "stain_brightness_jump": 20,
+    "stain_trial_mode": True,
 }
 
 
@@ -124,6 +139,7 @@ class MonitorApp:
         self.frame_q = queue.Queue(maxsize=2)
         self.status_q = queue.Queue()
         self.motion_q = queue.Queue()
+        self.stain_q = queue.Queue()
         # 单会话模式：视频 worker 通过本地回环 TCP 把音频 PCM 交给音频线程，
         # 音频线程不再拉第二路 RTSP，避免重复传输视频浪费带宽
         self._audio_sock_q = queue.Queue()
@@ -140,12 +156,25 @@ class MonitorApp:
         try:
             from detection import MotionDetector
             self.motion = MotionDetector(self.cfg)
+            logging.info("动作检测已启用：区域=%s，阈值=%.3f，持续确认=%.1f 秒",
+                         self.motion.roi, self.motion.threshold, self.motion.sustain)
         except Exception as e:  # noqa: BLE001
             logging.warning("动作检测初始化失败（不影响哭声监测）: %s", e)
             self.motion = None
         self._roi_arming = False   # 框选模式：下一次拖选即定婴儿床区域
         self._roi_drag = None      # 拖选中：(x0, y0, x1, y1) 显示像素
         self._last_motion_ui = 0.0  # 动作状态栏刷新节流
+        self._last_motion_score_log = 0.0  # 动作分数日志节流（诊断用）
+        # 污渍监测：复用婴儿床区域，白天才测；视频线程喂帧，主线程经 stain_q 更新状态栏
+        try:
+            from detection import StainDetector
+            self.stain = StainDetector(self.cfg)
+        except Exception as e:  # noqa: BLE001
+            logging.warning("污渍检测初始化失败（不影响哭声监测）: %s", e)
+            self.stain = None
+        self._last_stain_ui = 0.0  # 污渍状态栏刷新节流
+        self._stain_was_night = False  # 夜里跳过后，天亮要丢掉旧参考帧
+        self._stain_snap_dir = os.path.join(BASE_DIR, "stain_snapshots")
         self.video_label_img = None
         self._last_frame = None  # 上一帧 PIL 图，供窗口缩放时立即重绘
         self._resize_after_id = None  # 缩放防抖计时器
@@ -159,7 +188,7 @@ class MonitorApp:
         self._build_ui()
         self._poll()
         if not self.ffmpeg:
-            self.set_status("未找到 ffmpeg，监控无法启动", error=True)
+            self.set_status("未找到 ffmpeg.exe：请按 README 精简版一节下载，放到 exe 同目录", error=True)
 
     # ---------- 界面 ----------
     def _build_ui(self):
@@ -214,6 +243,8 @@ class MonitorApp:
                     else "婴儿床区域：未设置（看整幅画面）")
         self.roi_label = ttk.Label(info2, text=roi_text)
         self.roi_label.pack(side="left", padx=12)
+        self.stain_label = ttk.Label(info2, text="污渍：--")
+        self.stain_label.pack(side="left", padx=12)
 
         self.status_var = tk.StringVar(value="就绪")
         ttk.Label(self.root, textvariable=self.status_var, anchor="w",
@@ -297,6 +328,9 @@ class MonitorApp:
             self.cfg["motion_roi"] = self.motion.roi
         else:
             self.cfg["motion_roi"] = roi
+        if self.stain is not None:
+            # 污渍监测复用同一个婴儿床区域，不再单独框选
+            self.stain.set_roi(self.cfg["motion_roi"])
         self._save_config()
         self.roi_label.config(text="婴儿床区域：已设置")
         self.set_status("婴儿床区域已设置，只看框里的动静")
@@ -304,6 +338,8 @@ class MonitorApp:
     def _roi_clear(self, event):
         if self.motion is not None:
             self.motion.set_roi(None)
+        if self.stain is not None:
+            self.stain.set_roi(None)
         self.cfg["motion_roi"] = None
         self._save_config()
         self.roi_label.config(text="婴儿床区域：未设置（看整幅画面）")
@@ -377,6 +413,12 @@ class MonitorApp:
             pass
         try:
             while True:
+                text = self.stain_q.get_nowait()
+                self.stain_label.config(text=text)
+        except queue.Empty:
+            pass
+        try:
+            while True:
                 title, msg = self.alert_q.get_nowait()
                 self.last_label.config(text="上次提醒：" + time.strftime("%H:%M:%S"))
                 notify(title, msg)
@@ -439,6 +481,9 @@ class MonitorApp:
         self.motion_label.config(text="动作：--")
         if self.motion is not None:
             self.motion.reset()
+        self.stain_label.config(text="污渍：--")
+        if self.stain is not None:
+            self.stain.reset()
         self.set_status("已停止")
 
     def on_close(self):
@@ -520,12 +565,15 @@ class MonitorApp:
                 self.set_status("视频流已连接" + ("（音视频共用一路）" if self._shared_mode else ""))
                 if self.motion is not None:
                     self.motion.reset()  # 重连后画面基准变了，丢掉上一路的参考帧
+                if self.stain is not None:
+                    self.stain.reset()  # 同理，污渍的参考帧也丢掉
                 while self.running and not self.stop_event.is_set():
                     raw = p.stdout.read(frame_bytes)
                     if len(raw) < frame_bytes:
                         break
                     img = Image.frombytes("RGB", (w, h), raw, "raw", "BGR")
                     self._motion_feed(img)
+                    self._stain_feed(img)
                     # PIL Image 跨线程传递安全；PhotoImage 必须在主线程创建（tkinter 非线程安全）
                     try:
                         self.frame_q.put_nowait(img)
@@ -565,15 +613,78 @@ class MonitorApp:
                 logging.info("剧烈动作提醒：婴儿床区域动作突然加剧（强度 %.2f）", score)
                 self.alert_q.put(("👶 宝宝动得很厉害", "婴儿床区域动作突然加剧，快去看一下"))
             now = time.time()
+            # 诊断用：分数够得着 0.005 就记一行（每 2 秒最多一行），
+            # 下次测试直接看日志就知道检测有没有"看到"动作、离阈值多远
+            if score >= 0.005 and now - self._last_motion_score_log >= 2.0:
+                self._last_motion_score_log = now
+                logging.info("动作分数 %.3f（阈值 %.3f，区域 %s）",
+                             score, self.motion.threshold, self.motion.roi)
             if now - self._last_motion_ui >= 0.5:
                 self._last_motion_ui = now
                 text = {"quiet": "动作：安静",
                         "motion": "动作：有动作",
                         "vigorous": "动作：剧烈动作",
                         "lighting": "动作：光线变化（已忽略）"}.get(state, "动作：--")
-                self.motion_q.put(text)
+                self.motion_q.put(f"{text} {score:.3f}")
         except Exception as e:  # noqa: BLE001
             logging.warning("动作检测异常: %s", e)
+
+    def _stain_feed(self, img):
+        """视频线程：每帧喂污渍检测（白天才测，夜里红外跳过），事件记日志、
+        存截图；试验模式不弹窗。检测本身异常不影响视频和哭声监测。"""
+        if self.stain is None or not self.stain.enabled:
+            return
+        try:
+            from PIL import Image as _Image
+            import numpy as np
+            small_color = img.resize((160, 90), _Image.BILINEAR)
+            arr = np.asarray(small_color, dtype=np.int16)
+            now = time.time()
+            if not self.stain.is_day(arr):
+                # 夜里红外画面是灰度，色彩分低：跳过，并记下状态以便天亮重置参考帧
+                self._stain_was_night = True
+                if now - self._last_stain_ui >= 2.0:
+                    self._last_stain_ui = now
+                    self.stain_q.put("污渍：夜间暂停")
+                return
+            if self._stain_was_night:
+                # 天亮了：夜里画面和白天画面差太多，旧参考帧作废
+                self.stain.reset()
+                self._stain_was_night = False
+            small = img.convert("L").resize((160, 90), _Image.BILINEAR)
+            event, score, state = self.stain.feed(np.asarray(small, dtype=np.uint8))
+            if event in ("spit_up", "wet"):
+                kind_text = "疑似吐奶" if event == "spit_up" else "疑似尿湿"
+                logging.info("污渍提醒：%s（强度 %.3f）", kind_text, score)
+                snap = self._save_stain_snapshot(img, event)
+                if self.stain.trial_mode:
+                    logging.info("污渍试验模式：只记录不弹窗，截图 %s", snap)
+                elif event == "spit_up":
+                    self.alert_q.put(("🍼 疑似吐奶", "嘴部附近出现白色变化，快去看一下"))
+                else:
+                    self.alert_q.put(("💧 疑似尿湿", "身下附近出现深色水渍，快去看一下"))
+            if now - self._last_stain_ui >= 0.5:
+                self._last_stain_ui = now
+                text = {"watching": "污渍：白天监测中",
+                        "candidate": "污渍：发现可疑变化…",
+                        "lighting": "污渍：光线变化（已忽略）",
+                        "spit_up": "污渍：疑似吐奶（已记录）",
+                        "wet": "污渍：疑似尿湿（已记录）"}.get(state, "污渍：--")
+                self.stain_q.put(text)
+        except Exception as e:  # noqa: BLE001
+            logging.warning("污渍检测异常: %s", e)
+
+    def _save_stain_snapshot(self, img, event):
+        """存一张当前画面到 stain_snapshots/，文件名带时间与事件；失败返回 ''。"""
+        try:
+            os.makedirs(self._stain_snap_dir, exist_ok=True)
+            name = "%s_%s.png" % (time.strftime("%Y%m%d_%H%M%S"), event)
+            path = os.path.join(self._stain_snap_dir, name)
+            img.save(path, format="PNG")
+            return path
+        except Exception as e:  # noqa: BLE001
+            logging.warning("污渍截图保存失败: %s", e)
+            return ""
 
     # ---------- 音频检测 + 实时播放 ----------
     def _audio_loop(self):
