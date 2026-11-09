@@ -6,6 +6,7 @@ YAMNet 不可用（缺模型/缺推理库）时自动降级为纯音量模式，
 import csv
 import os
 import sys
+import time
 
 import numpy as np
 
@@ -145,3 +146,123 @@ class CryDetector:
             return False, ""
         self.loud_run = 0.0
         return True, "音量触发 RMS %.3f" % r
+
+
+def _parse_roi(raw):
+    """校验 motion_roi：[x0, y0, x1, y1]，均为 0~1 的相对坐标。
+    非法/面积过小返回 None（= 全幅检测）。"""
+    try:
+        x0, y0, x1, y1 = (float(v) for v in raw)
+    except Exception:  # noqa: BLE001
+        return None
+    x0, y0 = max(0.0, min(x0, 1.0)), max(0.0, min(y0, 1.0))
+    x1, y1 = max(0.0, min(x1, 1.0)), max(0.0, min(y1, 1.0))
+    if x1 - x0 < 0.05 or y1 - y0 < 0.05:
+        return None
+    return [x0, y0, x1, y1]
+
+
+class MotionDetector:
+    """帧差法动作检测：只看婴儿床区域内的画面变化。
+
+    输入：每帧一张小灰度图（调用方先把 640x360 帧缩到 160x90 左右，省 CPU）。
+    输出事件：None / "motion"（持续动作）/ "vigorous"（剧烈动作）。
+    开灯、红外夜视切换这类整幅亮度跳变会直接跳过该帧，不误报。
+    注意：它只能报"动了"——吐奶、尿湿在画面上几乎看不见，
+    靠它检不出来（见 README 动作监测一节的如实说明）。
+    """
+
+    def __init__(self, cfg):
+        self.enabled = bool(cfg.get("motion_enabled", True))
+        self.roi = _parse_roi(cfg.get("motion_roi"))
+        self.threshold = float(cfg.get("motion_threshold", 0.03))
+        self.high_threshold = float(cfg.get("motion_high_threshold", 0.12))
+        self.pixel_diff = int(cfg.get("motion_pixel_diff", 25))
+        self.sustain = float(cfg.get("motion_sustain_seconds", 2.0))
+        self.high_sustain = float(cfg.get("motion_high_sustain_seconds", 1.0))
+        self.cooldown = float(cfg.get("motion_cooldown_seconds", 60))
+        self.brightness_jump = float(cfg.get("motion_brightness_jump", 20))
+        self.prev = None
+        self._last_t = None
+        self.motion_run = 0.0
+        self.high_run = 0.0
+        self.last_alert = 0.0
+        self.last_score = 0.0
+        self.last_state = "quiet"  # quiet | motion | vigorous | lighting
+
+    def set_roi(self, roi):
+        self.roi = _parse_roi(roi)
+        self.reset()
+
+    def reset(self):
+        self.prev = None
+        self._last_t = None
+        self.motion_run = 0.0
+        self.high_run = 0.0
+        self.last_state = "quiet"
+
+    def _region(self, gray):
+        """按 ROI 裁一块；无 ROI 返回整幅。"""
+        if not self.roi:
+            return gray
+        h, w = gray.shape[:2]
+        x0 = max(0, int(self.roi[0] * w))
+        y0 = max(0, int(self.roi[1] * h))
+        x1 = max(x0 + 1, int(self.roi[2] * w))
+        y1 = max(y0 + 1, int(self.roi[3] * h))
+        return gray[y0:y1, x0:x1]
+
+    def feed(self, gray, dt=None, now=None):
+        """喂一帧小灰度图（2D uint8 ndarray）。
+        返回 (event, score, state)：event 为 None / "motion" / "vigorous"；
+        score 是 ROI 内变化像素占比；state 是当前状态。"""
+        if not self.enabled:
+            return None, 0.0, "quiet"
+        gray = np.asarray(gray)
+        if gray.ndim != 2 or gray.size == 0:
+            return None, 0.0, "quiet"
+        if now is None:
+            now = time.time()
+        if dt is None:
+            dt = 0.0 if self._last_t is None else max(0.0, now - self._last_t)
+        self._last_t = now
+        if self.prev is None or self.prev.shape != gray.shape:
+            self.prev = gray.copy()
+            self.motion_run = 0.0
+            self.high_run = 0.0
+            return None, 0.0, "quiet"
+        # 整幅亮度跳变（开灯、红外夜视切换）：跳过该帧并以当前帧为新基准
+        mean_shift = abs(float(gray.mean()) - float(self.prev.mean()))
+        if mean_shift > self.brightness_jump:
+            self.prev = gray.copy()
+            self.motion_run = 0.0
+            self.high_run = 0.0
+            self.last_state = "lighting"
+            return None, 0.0, "lighting"
+        region = self._region(gray)
+        prev_region = self._region(self.prev)
+        diff = np.abs(region.astype(np.int16) - prev_region.astype(np.int16))
+        score = float((diff > self.pixel_diff).mean())
+        self.prev = gray.copy()
+        self.last_score = score
+        if score >= self.high_threshold:
+            self.high_run += dt
+            self.motion_run += dt
+        elif score >= self.threshold:
+            self.motion_run += dt
+            self.high_run = 0.0
+        else:
+            self.motion_run = 0.0
+            self.high_run = 0.0
+        event = None
+        if self.high_run >= self.high_sustain and now - self.last_alert >= self.cooldown:
+            event = "vigorous"
+        elif self.motion_run >= self.sustain and now - self.last_alert >= self.cooldown:
+            event = "motion"
+        if event is not None:
+            self.last_alert = now
+            self.motion_run = 0.0
+            self.high_run = 0.0
+        self.last_state = ("vigorous" if self.high_run > 0
+                           else "motion" if self.motion_run > 0 else "quiet")
+        return event, score, self.last_state
