@@ -25,33 +25,12 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt pyinstaller
 
-      - name: Download YAMNet model
-        shell: pwsh
-        run: |
-          $url = "https://tfhub.dev/google/lite-model/yamnet/classification/tflite/1?lite-format=tflite"
-          $out = "assets/yamnet.tflite"
-          $ok = $false
-          for ($i = 1; $i -le 5; $i++) {
-            try {
-              Invoke-WebRequest -Uri $url -OutFile $out -UseBasicParsing -TimeoutSec 120
-              if ((Get-Item $out).Length -gt 1000000) { $ok = $true; break }
-            } catch { Start-Sleep -Seconds 10 }
-          }
-          if (-not $ok) { throw "model download failed" }
-          Get-Item $out | Select-Object Name, Length
-
-      - name: Stage ffmpeg binary
-        shell: pwsh
-        run: |
-          python -c "import imageio_ffmpeg, shutil; shutil.copy(imageio_ffmpeg.get_ffmpeg_exe(), 'ffmpeg.exe')"
-          dir ffmpeg.exe
-
+      # 精简版：exe 里不再打包 ffmpeg 和 YAMNet 模型（见 README 精简版一节），
+      # 只打包类别映射表（很小）；ffmpeg 和模型由使用者自己下载、放 exe 旁。
       - name: Build EXE
         shell: pwsh
         run: >
           pyinstaller --onefile --windowed --name BabyCryMonitor
-          --add-binary "ffmpeg.exe;."
-          --add-data "assets/yamnet.tflite;assets"
           --add-data "assets/yamnet_class_map.csv;assets"
           cry_monitor.py
 
