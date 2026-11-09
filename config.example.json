@@ -8,5 +8,14 @@
   "video_height": 360,
   "video_width": 640,
   "yamnet_threshold": 0.5,
-  "rtsp_transport": "udp"
+  "rtsp_transport": "udp",
+  "motion_enabled": true,
+  "motion_roi": null,
+  "motion_threshold": 0.03,
+  "motion_high_threshold": 0.12,
+  "motion_pixel_diff": 25,
+  "motion_sustain_seconds": 2.0,
+  "motion_high_sustain_seconds": 1.0,
+  "motion_cooldown_seconds": 60,
+  "motion_brightness_jump": 20
 }
