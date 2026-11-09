@@ -17,5 +17,15 @@
   "motion_sustain_seconds": 2.0,
   "motion_high_sustain_seconds": 1.0,
   "motion_cooldown_seconds": 60,
-  "motion_brightness_jump": 20
+  "motion_brightness_jump": 20,
+  "stain_enabled": true,
+  "stain_bright_threshold": 25,
+  "stain_dark_threshold": 25,
+  "stain_min_fraction": 0.005,
+  "stain_sustain_seconds": 60.0,
+  "stain_ref_interval_seconds": 600.0,
+  "stain_cooldown_seconds": 600.0,
+  "stain_saturation_threshold": 8.0,
+  "stain_brightness_jump": 20,
+  "stain_trial_mode": true
 }
