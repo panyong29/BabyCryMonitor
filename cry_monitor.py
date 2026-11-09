@@ -21,7 +21,7 @@ import time
 import tkinter as tk
 from tkinter import messagebox, ttk
 
-APP_VERSION = "2.1.0"
+APP_VERSION = "2.1.1"
 
 # Windows 下拉起 ffmpeg（控制台程序）时不弹黑框；非 Windows 为 0 无影响
 _NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
