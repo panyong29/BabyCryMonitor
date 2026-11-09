@@ -69,7 +69,7 @@ YAMNet 加载失败时自动降级为**纯音量模式**（界面会显示），
     yamnet.tflite             ← 第 3 步下载的（可选）
 ```
 
-为什么拆开：v2.0.0 之前 ffmpeg（约 75 MB）和模型是打进 exe 里一起发的，exe 113 MB，每次更新都要重新下载一整份。v2.1.0 起 exe 只有约 30 MB，ffmpeg 和模型一次下载、一直复用，以后更新只下 exe。如实说一句：第一次装的总下载量反而稍多（约 30 + 114 + 4 MB），省的是以后每次更新的量；只想"下载一次就能用"的，v2.0.0 的完整版还在 Releases 里。
+为什么拆开：v2.0.0 之前 ffmpeg 和模型是打进 exe 里一起发的，exe 113 MB，每次更新都要重新下载一整份。v2.1.1 起 exe 约 34 MB，ffmpeg 和模型一次下载、一直复用，以后更新只下 exe。如实说一句：第一次装的总下载量反而稍多（约 34 + 114 + 4 MB），省的是以后每次更新的量；只想"下载一次就能用"的，v2.1.0 的版本还在 Releases 里（72.9MB，ffmpeg 仍在里面）。注意：v2.1.0 的 exe 是 72.9MB，ffmpeg 其实还在里面（打包步骤没排干净）；v2.1.1 才真正把它排掉。
 
 ## 自检
 
@@ -114,7 +114,9 @@ YAMNet 加载失败时自动降级为**纯音量模式**（界面会显示），
 打 tag 即自动构建：`git tag v1.0.0 && git push origin v1.0.0`，
 GitHub Actions（windows-latest）会自动打出 `BabyCryMonitor.exe` 并建 Release。
 
-v2.1.0 起是精简版：exe 里只打包程序本身和类别映射表（约 30 MB），
+v2.1.1 起是精简版：exe 里只打包程序本身和类别映射表（约 34 MB），
 ffmpeg 和 YAMNet 模型不再打进去，由使用者按上面"安装"一节自己下载、
-放 exe 旁。本地从源码跑仍和以前一样（`pip install -r requirements.txt`，
-ffmpeg 走 imageio-ffmpeg，模型放 `assets/yamnet.tflite`）。
+放 exe 旁（构建前会删掉 imageio-ffmpeg 包自带的 ffmpeg.exe，否则
+PyInstaller 会把它当包数据又收进去——v2.1.0 就是这么漏掉的）。本地从源码跑
+仍和以前一样（`pip install -r requirements.txt`，ffmpeg 走 imageio-ffmpeg，
+模型放 `assets/yamnet.tflite`）。
